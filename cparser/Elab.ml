@@ -21,7 +21,7 @@ open Machine
 open Cabs
 open C
 open Diagnostics
-open !Cutil
+open! Cutil
 
 (** * Utility functions *)
 
@@ -39,7 +39,16 @@ let warning loc =
 let print_typ env fmt ty =
   match ty with
   | TNamed _  ->
-      Format.fprintf fmt "'%a' (aka '%a')" Cprint.typ_raw ty Cprint.typ_raw (unroll env ty)
+    Format.fprintf fmt "'%a'" Cprint.typ_raw ty;
+    let ty' = unroll env ty in
+    if not (is_anonymous_type ty')
+    then Format.fprintf fmt " (aka '%a')" Cprint.typ_raw ty'
+  | TStruct (id,_) when id.C.name = "" ->
+    Format.fprintf fmt "'struct <anonymous>'"
+  | TUnion (id,_) when id.C.name = "" ->
+    Format.fprintf fmt "'union <anonymous>'"
+  | TEnum (id,_) when id.C.name = "" ->
+    Format.fprintf fmt "'enum <anonymous>'"
   | _ -> Format.fprintf fmt "'%a'" Cprint.typ_raw ty
 
 let pp_field fmt id =
@@ -172,7 +181,7 @@ let combine_toplevel_definitions loc env s old_sto old_ty sto ty =
 	error loc "static declaration of '%s' follows non-static declaration" s;
         sto
     | Storage_static,_ -> Storage_static (* Static stays static *)
-    | Storage_extern,_ -> sto
+    | Storage_extern,_ -> if is_function_type env new_ty then Storage_extern else sto
     | Storage_default,Storage_extern ->
       if is_global_defined s && is_function_type env ty then
         warning loc Extern_after_definition "this extern declaration follows a non-extern definition and is ignored";
@@ -258,7 +267,7 @@ let enter_or_refine_function loc env id sto ty =
 
 (* Forward declarations *)
 
-let elab_expr_f : (cabsloc -> Env.t -> Cabs.expression -> C.exp * Env.t) ref
+let elab_expr_f : (Cabs.loc -> Env.t -> Cabs.expression -> C.exp * Env.t) ref
   = ref (fun _ _ _ -> assert false)
 
 let elab_funbody_f : (C.typ -> bool -> bool -> Env.t -> statement -> C.stmt) ref
@@ -411,12 +420,11 @@ let elab_char_constant loc wide chars =
     warning loc Unnamed "character constant too long for its type";
   (* C99 6.4.4.4 item 10: single character -> represent at type char
      or wchar_t *)
-  let k =
+  Ceval.normalize_int v
     (if List.length chars = 1 then
        if wide then wchar_ikind() else IChar
      else
-       IInt) in
-  (Ceval.normalize_int v k, k)
+       IInt)
 
 let elab_string_literal loc wide chars =
   let nbits = if wide then 8 * !config.sizeof_wchar else 8 in
@@ -444,7 +452,8 @@ let elab_constant loc = function
       let (v, fk) = elab_float_constant f in
       CFloat(v, fk)
   | CONST_CHAR(wide, s) ->
-      CInt(fst (elab_char_constant loc wide s), IInt, "")
+      let ikind = if wide then wchar_ikind () else IInt in
+      CInt(elab_char_constant loc wide s, ikind, "")
   | CONST_STRING(wide, s) ->
       elab_string_literal loc wide s
 
@@ -837,7 +846,7 @@ and elab_type_declarator ?(fundef = false) loc env ty = function
   | Cabs.PROTO(d, (params, vararg)) ->
       elab_return_type loc env ty;
       let (ty, a) = get_nontype_attrs env ty in
-      let (params', env') = elab_parameters env params in
+      let (params', env') = elab_parameters loc env params in
       (* For a function declaration (fundef = false), the scope introduced
          to treat parameters ends here, so we discard the extended
          environment env' returned by elab_parameters.
@@ -863,13 +872,15 @@ and elab_type_declarator ?(fundef = false) loc env ty = function
 
 (* Elaboration of parameters in a prototype *)
 
-and elab_parameters env params =
+and elab_parameters loc env params =
   (* Prototype introduces a new scope *)
   let (vars, env) = mmap elab_parameter (Env.new_scope env) params in
   (* Catch special case f(t) where t is void or a typedef to void *)
   match vars with
     | [ ( {C.name=""}, t) ] when is_void_type env t -> [],env
-    | _ -> vars,env
+    | _ -> if List.exists (fun (id, t) -> id.C.name = "" && is_void_type env t) vars then
+        error loc "'void' must be the only parameter";
+      (vars, env)
 
 (* Elaboration of a function parameter *)
 
@@ -942,31 +953,7 @@ and elab_name_group loc env  (spec, namelist) =
     ((id, add_attributes_type a ty), env1) in
   (mmap elab_one_name env' namelist, sto)
 
-(* Elaboration of an init-name group *)
 
-and elab_init_name_group loc env (spec, namelist) =
-  let (sto, inl, noret, tydef, bty, env') =
-    elab_specifier ~only:(namelist=[]) loc env spec in
-  if noret && tydef then
-    error loc "'_Noreturn' can only appear on functions";
-  let elab_one_name env (Init_name (Name (id, decl, attr, loc), init)) =
-    let ((ty, _), env1) =
-      elab_type_declarator loc env bty decl in
-    let a = elab_attributes env attr in
-    let has_fun_typ = is_function_type env ty in
-    if inl && not has_fun_typ then
-      error loc "'inline' can only appear on functions";
-    let a' =
-      if noret then begin
-        warning loc Celeven_extension "_Noreturn functions are a C11 extension";
-        if not has_fun_typ then
-          error loc "'_Noreturn' can only appear on functions";
-        add_attributes [Attr("noreturn",[])] a
-      end else a in
-    if has_std_alignas env ty && has_fun_typ then
-      error loc "alignment specified for function '%s'" id;
-    ((id, add_attributes_type a' ty, init), env1) in
-  (mmap elab_one_name env' namelist, sto, tydef)
 
 (* Elaboration of a field group *)
 
@@ -1079,7 +1066,7 @@ and elab_struct_or_union_info kind loc env members attrs =
   | fld :: rem ->
       if wrap incomplete_type loc env' fld.fld_typ then
         (* Must be fatal otherwise we get problems constructing the init *)
-        fatal_error loc "member '%a' has incomplete type" pp_field fld.fld_name;
+        fatal_error loc "member '%a' has incomplete type %a" pp_field fld.fld_name (print_typ env) fld.fld_typ;
       if wrap contains_flex_array_mem loc env' fld.fld_typ && kind = Struct then
         warning loc Flexible_array_extensions "%a may not be used as a struct member due to flexible array member" (print_typ env) fld.fld_typ;
       check_reduced_alignment loc env' fld.fld_typ;
@@ -1634,7 +1621,7 @@ end;
 try
   elab_item (I.top env root ty_root) ie []
 with No_default_init ->
-  error loc "variable has incomplete type %a" Cprint.typ ty_root;
+  error loc "variable has incomplete type %a" (print_typ env) ty_root;
   raise Exit
 
 (* Elaboration of a top-level initializer *)
@@ -1709,7 +1696,7 @@ let elab_expr ctx loc env a =
         error "arithmetic on a pointer to an incomplete type %a in binary '%c'" (print_typ env) ty s
   in
 
-  let check_static_var id sto ty =
+  let check_static_var env id sto ty =
     if ctx.ctx_nonstatic_inline
     && sto = Storage_static
     && List.mem AConst (attributes_of_type env ty)
@@ -1723,7 +1710,7 @@ let elab_expr ctx loc env a =
   | VARIABLE s ->
       begin match wrap Env.lookup_ident loc env s with
         | (id, Env.II_ident(sto, ty)) ->
-          check_static_var id sto ty;
+          check_static_var env id sto ty;
           { edesc = EVar id; etyp = ty },env
       | (id, Env.II_enum v) ->
           { edesc = EConst(CEnum(id, v)); etyp = TInt(enum_ikind, []) },env
@@ -1825,13 +1812,54 @@ let elab_expr ctx loc env a =
           (print_typ env) ty (print_typ env) ty'  (print_typ env) ty'  (print_typ env) ty;
       { edesc = ECall(ident, [b2; b3]); etyp = ty },env
 
+  | CALL((VARIABLE "__builtin_sel" as a0), al) ->
+      begin match al with
+      | [a1; a2; a3] ->
+          let b0,env = elab env a0 in
+          let b1,env = elab env a1 in
+          let b2,env = elab env a2 in
+          let b3,env = elab env a3 in
+          if not (is_scalar_type env b1.etyp) then
+            error "first argument of '__builtin_sel' is not a scalar type (invalid %a)"
+               (print_typ env) b1.etyp;
+          let tyres =
+            match pointer_decay env b2.etyp, pointer_decay env b3.etyp with
+            | (TInt _ | TFloat _ | TEnum _), (TInt _ | TFloat _ | TEnum _) ->
+                binary_conversion env b2.etyp b3.etyp
+            | (TPtr(ty1, a1) as pty1), (TPtr(ty2, a2)  as pty2) ->
+                if is_void_type env ty1 || is_void_type env ty2 then
+                  TPtr(TVoid (add_attributes a1 a2), [])
+                else begin
+                  match combine_types AttrIgnoreAll env pty1 pty2 with
+                  | None ->
+                      warning Pointer_type_mismatch "the second and third arguments of '__builtin_sel' have incompatible pointer types (%a and %a)"
+                     (print_typ env) pty1  (print_typ env) pty2;
+                     (* tolerance *)
+                     TPtr(TVoid (add_attributes a1 a2), [])
+                  | Some ty -> ty
+                end
+            | _, _ ->
+                fatal_error "wrong types (%a and %a) for the second and third arguments of '__builtin_sel'"
+                  (print_typ env) b2.etyp (print_typ env) b3.etyp
+
+            in
+          { edesc = ECall(b0, [b1; b2; b3]); etyp = tyres }, env
+      | _ ->
+          fatal_error "'__builtin_sel' expect 3 arguments"
+      end
+
   | CALL(a1, al) ->
       let b1,env =
         (* Catch the old-style usage of calling a function without
            having declared it *)
         match a1 with
         | VARIABLE n when not (Env.ident_is_bound env n) ->
-            warning Implicit_function_declaration "implicit declaration of function '%s' is invalid in C99" n;
+            let is_builtin = String.length n > 10
+                           && String.sub n 0 10 = "__builtin_" in
+            if is_builtin then
+              error "use of unknown builtin '%s'" n
+            else
+              warning Implicit_function_declaration "implicit declaration of function '%s' is invalid in C99" n;
             let ty = TFun(TInt(IInt, []), None, false, []) in
             (* Check against other definitions and enter in env *)
             let (id, sto, env, ty, linkage) =
@@ -1840,7 +1868,7 @@ let elab_expr ctx loc env a =
             emit_elab ~linkage env loc (Gdecl(sto, id, ty, None));
             { edesc = EVar id; etyp = ty },env
         | _ -> elab env a1 in
-      let bl = mmap elab env al in
+      let (bl, env) = mmap elab env al in
       (* Extract type information *)
       let (res, args, vararg) =
         match unroll env b1.etyp with
@@ -1855,14 +1883,19 @@ let elab_expr ctx loc env a =
       (* Type-check the arguments against the prototype *)
       let bl',env =
         match args with
-        | None -> bl
-        | Some proto -> elab_arguments 1 bl proto vararg in
+        | None ->
+          List.iter (fun arg ->
+              let arg_typ = argument_conversion env arg.etyp in
+              if incomplete_type env arg_typ then
+                error "argument type %a is incomplete" (print_typ env) arg.etyp;
+            ) bl; (bl,env)
+        | Some proto -> elab_arguments 1 (bl, env) proto vararg in
       { edesc = ECall(b1, bl'); etyp = res },env
 
   | UNARY(POSINCR, a1) ->
-      elab_pre_post_incr_decr Opostincr "increment" a1
+      elab_pre_post_incr_decr env Opostincr "increment" a1
   | UNARY(POSDECR, a1) ->
-      elab_pre_post_incr_decr Opostdecr "decrement" a1
+      elab_pre_post_incr_decr env Opostdecr "decrement" a1
 
 (* 6.5.4 Cast operators *)
 
@@ -1891,6 +1924,8 @@ let elab_expr ctx loc env a =
 
   | CAST ((spec, dcl), ie) ->
       let (ty, env) = elab_type loc env spec dcl in
+      if not (is_array_type env ty) && incomplete_type env ty then
+        fatal_error "ill-formed compound literal with incomplete type %a" (print_typ env) ty;
       begin match elab_initializer loc env "<compound literal>" ty ie with
       | (ty', Some i) -> { edesc = ECompound(ty', i); etyp = ty' },env
       | (ty', None)   -> fatal_error "ill-formed compound literal"
@@ -2021,20 +2056,20 @@ let elab_expr ctx loc env a =
       end
 
   | UNARY(PREINCR, a1) ->
-      elab_pre_post_incr_decr Opreincr "increment" a1
+      elab_pre_post_incr_decr env Opreincr "increment" a1
   | UNARY(PREDECR, a1) ->
-      elab_pre_post_incr_decr Opredecr "decrement" a1
+      elab_pre_post_incr_decr env Opredecr "decrement" a1
 
 (* 6.5.5 to 6.5.12  Binary operator expressions *)
 
   | BINARY(MUL, a1, a2) ->
-      elab_binary_arithmetic "*" Omul a1 a2
+      elab_binary_arithmetic env "*" Omul a1 a2
 
   | BINARY(DIV, a1, a2) ->
-      elab_binary_arithmetic "/" Odiv a1 a2
+      elab_binary_arithmetic env "/" Odiv a1 a2
 
   | BINARY(MOD, a1, a2) ->
-      elab_binary_integer "%" Omod a1 a2
+      elab_binary_integer env "%" Omod a1 a2
 
   | BINARY(ADD, a1, a2) ->
       let b1,env = elab env a1 in
@@ -2084,37 +2119,37 @@ let elab_expr ctx loc env a =
       { edesc = EBinop(Osub, b1, b2, tyop); etyp = tyres },env
 
   | BINARY(SHL, a1, a2) ->
-      elab_shift "<<" Oshl a1 a2
+      elab_shift env "<<" Oshl a1 a2
 
   | BINARY(SHR, a1, a2) ->
-      elab_shift ">>" Oshr a1 a2
+      elab_shift env ">>" Oshr a1 a2
 
   | BINARY(EQ, a1, a2) ->
-      elab_comparison Oeq a1 a2
+      elab_comparison env Oeq a1 a2
   | BINARY(NE, a1, a2) ->
-      elab_comparison One a1 a2
+      elab_comparison env One a1 a2
   | BINARY(LT, a1, a2) ->
-      elab_comparison Olt a1 a2
+      elab_comparison env Olt a1 a2
   | BINARY(GT, a1, a2) ->
-      elab_comparison Ogt a1 a2
+      elab_comparison env Ogt a1 a2
   | BINARY(LE, a1, a2) ->
-      elab_comparison Ole a1 a2
+      elab_comparison env Ole a1 a2
   | BINARY(GE, a1, a2) ->
-      elab_comparison Oge a1 a2
+      elab_comparison env Oge a1 a2
 
   | BINARY(BAND, a1, a2) ->
-      elab_binary_integer "&" Oand a1 a2
+     elab_binary_integer env "&" Oand a1 a2
   | BINARY(BOR, a1, a2) ->
-      elab_binary_integer "|" Oor a1 a2
+     elab_binary_integer env "|" Oor a1 a2
   | BINARY(XOR, a1, a2) ->
-      elab_binary_integer "^" Oxor a1 a2
+     elab_binary_integer env "^" Oxor a1 a2
 
 (* 6.5.13 and 6.5.14 Logical operator expressions *)
 
   | BINARY(AND, a1, a2) ->
-      elab_logical_operator "&&" Ologand a1 a2
+      elab_logical_operator env "&&" Ologand a1 a2
   | BINARY(OR, a1, a2) ->
-      elab_logical_operator "||" Ologor a1 a2
+      elab_logical_operator env "||" Ologor a1 a2
 
 (* 6.5.15 Conditional expressions *)
   | QUESTION(a1, a2, a3) ->
@@ -2230,7 +2265,7 @@ let elab_expr ctx loc env a =
       { edesc = EBinop (Ocomma, b1, b2, ty2); etyp = ty2 },env
 
 (* Elaboration of pre- or post- increment/decrement *)
-  and elab_pre_post_incr_decr op msg a1 =
+  and elab_pre_post_incr_decr env op msg a1 =
     let b1,env = elab env a1 in
     if not (is_modifiable_lvalue env b1) then
       error "expression is not assignable";
@@ -2239,7 +2274,7 @@ let elab_expr ctx loc env a =
     { edesc = EUnop(op, b1); etyp = b1.etyp },env
 
 (* Elaboration of binary operators over integers *)
-  and elab_binary_integer msg op a1 a2 =
+  and elab_binary_integer env msg op a1 a2 =
     let b1,env = elab env a1 in
     let b2,env = elab env a2 in
     if not ((is_integer_type env b1.etyp) && (is_integer_type env b2.etyp)) then
@@ -2249,7 +2284,7 @@ let elab_expr ctx loc env a =
     { edesc = EBinop(op, b1, b2, tyres); etyp = tyres },env
 
 (* Elaboration of binary operators over arithmetic types *)
-  and elab_binary_arithmetic msg op a1 a2 =
+  and elab_binary_arithmetic env msg op a1 a2 =
     let b1,env = elab env a1 in
     let b2,env = elab env a2 in
     if not ((is_arith_type env b1.etyp) && (is_arith_type env b2.etyp)) then
@@ -2259,7 +2294,7 @@ let elab_expr ctx loc env a =
     { edesc = EBinop(op, b1, b2, tyres); etyp = tyres },env
 
 (* Elaboration of shift operators *)
-  and elab_shift msg op a1 a2 =
+  and elab_shift env msg op a1 a2 =
     let b1,env = elab env a1 in
     let b2,env = elab env a2 in
     if not ((is_integer_type env b1.etyp) && (is_integer_type env b2.etyp)) then
@@ -2269,7 +2304,7 @@ let elab_expr ctx loc env a =
     { edesc = EBinop(op, b1, b2, tyres); etyp = tyres },env
 
 (* Elaboration of comparisons *)
-  and elab_comparison op a1 a2 =
+  and elab_comparison env op a1 a2 =
       let b1,env = elab env a1 in
       let b2,env = elab env a2 in
       let resdesc =
@@ -2306,7 +2341,7 @@ let elab_expr ctx loc env a =
       { edesc = resdesc; etyp = TInt(IInt, []) },env
 
 (* Elaboration of && and || *)
-  and elab_logical_operator msg op a1 a2 =
+  and elab_logical_operator env msg op a1 a2 =
     let b1,env = elab env a1 in
     let b2,env = elab env a2 in
     if not ((is_scalar_type env b1.etyp) && (is_scalar_type env b2.etyp)) then
@@ -2374,113 +2409,106 @@ let __func__type_and_init s =
 
 (* Elaboration of top-level and local definitions *)
 
-let enter_typedefs loc env sto dl =
-  if sto <> Storage_default then
-    error loc "non-default storage class on 'typedef' definition";
-  if dl = [] then
-    warning loc Missing_declarations "typedef requires a name";
-  List.fold_left (fun env (s, ty, init) ->
-    if init <> NO_INIT then
-      error loc "initializer in typedef";
-    if has_std_alignas env ty then
-      error loc "alignment specified for typedef '%s'" s;
-    List.iter
-      (fun a -> match class_of_attribute a with
-                | Attr_object | Attr_struct ->
-                    error loc "attribute '%s' not allowed in 'typedef'"
-                              (name_of_attribute a)
-                | _ -> ())
-      (attributes_of_type_no_expand ty);
-    match previous_def Env.lookup_typedef env s with
-    | Some (s',ty') when Env.in_current_scope env s' ->
-        if equal_types env ty ty' then begin
-          warning loc Celeven_extension "redefinition of typedef '%s' is a C11 extension" s;
-          env
-        end else begin
-          error loc "typedef redefinition with different types (%a vs %a)"
-            (print_typ env) ty (print_typ env) ty';
-          env
-        end
-    | _ ->
-        if redef Env.lookup_ident env s then
-          error loc "redefinition of '%s' as different kind of symbol" s;
-        let (id, env') = Env.enter_typedef env s ty in
-        check_reduced_alignment loc env' ty;
-        emit_elab env loc (Gtypedef(id, ty));
-        env') env dl
+let enter_typedef loc env sto (s, ty, init) =
+  if init <> NO_INIT then
+    error loc "initializer in typedef";
+  if has_std_alignas env ty then
+    error loc "alignment specified for typedef '%s'" s;
+  List.iter
+    (fun a -> match class_of_attribute a with
+       | Attr_object | Attr_struct ->
+         error loc "attribute '%s' not allowed in 'typedef'"
+           (name_of_attribute a)
+       | _ -> ())
+    (attributes_of_type_no_expand ty);
+  match previous_def Env.lookup_typedef env s with
+  | Some (s',ty') when Env.in_current_scope env s' ->
+    if equal_types env ty ty' then begin
+      warning loc Celeven_extension "redefinition of typedef '%s' is a C11 extension" s;
+      env
+    end
+    else begin
+      error loc "redefinition of typedef '%s' with different type (%a vs %a)"
+        s (print_typ env) ty (print_typ env) ty';
+      env
+    end
+  | _ ->
+    if redef Env.lookup_ident env s then
+      error loc "redefinition of '%s' as different kind of symbol" s;
+    let (id, env') = Env.enter_typedef env s ty in
+    check_reduced_alignment loc env' ty;
+    emit_elab env loc (Gtypedef(id, ty));
+    env'
 
-let enter_decdefs local nonstatic_inline loc env sto dl =
-  (* Sanity checks on storage class *)
-  if (sto = Storage_auto || sto = Storage_register) && not local then
-    fatal_error loc "illegal storage class %s on file-scoped variable"
-                    (name_of_storage_class sto);
-  if sto <> Storage_default && dl = [] then
-    warning loc Missing_declarations "declaration does not declare anything";
-  let enter_decdef (decls, env) (s, ty, init) =
-    let isfun = is_function_type env ty in
-    if sto = Storage_register && has_std_alignas env ty then
-      error loc "alignment specified for 'register' object '%s'" s;
-    if sto = Storage_extern && init <> NO_INIT then
-      error loc "'extern' declaration variable has an initializer";
-    if local && isfun then begin
-      match sto with
-      | Storage_static ->
-          error loc "function declared in block scope cannot have 'static' storage class"
-      | Storage_auto | Storage_register ->
-          error loc "illegal storage class %s on function"
-                    (name_of_storage_class sto)
+let enter_decdef local nonstatic_inline loc sto (decls, env) (s, ty, init) =
+  let isfun = is_function_type env ty in
+  let has_init = init <> NO_INIT in
+  if sto = Storage_register && has_std_alignas env ty then
+    error loc "alignment specified for 'register' object '%s'" s;
+  if sto = Storage_extern && has_init then
+    error loc "'extern' declaration variable has an initializer";
+  if local && isfun then begin
+    match sto with
+    | Storage_static ->
+      error loc "function declared in block scope cannot have 'static' storage class"
+    | Storage_auto | Storage_register ->
+      error loc "illegal storage class %s on function"
+        (name_of_storage_class sto)
+    | _ -> ()
+  end;
+  if is_qualified_array ty then
+    error loc "type qualifier used in array declarator outside of function prototype";
+  (* Local variable declarations with default storage are treated as 'auto'.
+     Local function declarations with default storage remain with
+     default storage. *)
+  let sto1 =
+    if local && sto = Storage_default && not isfun
+    then Storage_auto
+    else sto in
+  (* enter ident in environment with declared type, because
+     initializer can refer to the ident *)
+  let (id, sto', env1, ty, linkage) =
+    enter_or_refine_ident local loc env s sto1 ty in
+  if has_init && not local then
+    add_global_define loc s;
+  (* check if the type is void or incomplete and the declaration is initialized *)
+  if not isfun then begin
+    let incomplete_init = not (is_array_type env1 ty) && wrap incomplete_type loc env1 ty && has_init in
+    if is_void_type env1 ty || incomplete_init then
+      fatal_error loc "variable '%s' has incomplete type %a" s (print_typ env) ty;
+  end;
+  (* process the initializer *)
+  let (ty', init') = elab_initializer loc env1 s ty init in
+  (* update environment with refined type *)
+  let env2 = Env.add_ident env1 id sto' ty' in
+  (* check for incomplete type *)
+  if not isfun && wrap incomplete_type loc env ty' then
+    if not local && sto' = Storage_static then begin
+      warning loc Tentative_incomplete_static "tentative static definition with incomplete type";
+    end
+    else if local && sto' <> Storage_extern then
+      error loc "variable '%s' has incomplete type %a" s (print_typ env) ty';
+  (* check if alignment is reduced *)
+  check_reduced_alignment loc env ty';
+  (* check for static variables in nonstatic inline functions *)
+  if local && nonstatic_inline
+     && sto' = Storage_static
+     && not (List.mem AConst (attributes_of_type env ty')) then
+    warning loc Static_in_inline "non-constant static local variable '%s' in inline function may be different in different files" s;
+  if local && not isfun && sto' <> Storage_extern && sto' <> Storage_static then
+    (* Local definition *)
+    ((sto', id, ty', init') :: decls, env2)
+  else begin
+    (* Global definition *)
+    emit_elab ~linkage env2 loc (Gdecl(sto', id, ty', init'));
+    (* Make sure the initializer is constant. *)
+    begin match init' with
+      | Some i when not (Ceval.is_constant_init env2 i) ->
+        error loc "initializer is not a compile-time constant"
       | _ -> ()
     end;
-    if is_qualified_array ty then
-      error loc "type qualifier used in array declarator outside of function prototype";
-    (* Local variable declarations with default storage are treated as 'auto'.
-       Local function declarations with default storage remain with
-       default storage. *)
-    let sto1 =
-      if local && sto = Storage_default && not isfun
-      then Storage_auto
-      else sto in
-    (* enter ident in environment with declared type, because
-       initializer can refer to the ident *)
-    let (id, sto', env1, ty, linkage) =
-      enter_or_refine_ident local loc env s sto1 ty in
-    if init <> NO_INIT && not local then
-      add_global_define loc s;
-    if not isfun && is_void_type env ty then
-      fatal_error loc "'%s' has incomplete type" s;
-    (* process the initializer *)
-    let (ty', init') = elab_initializer loc env1 s ty init in
-    (* update environment with refined type *)
-    let env2 = Env.add_ident env1 id sto' ty' in
-    (* check for incomplete type *)
-    if not isfun && wrap incomplete_type loc env ty' then
-      if not local && sto' = Storage_static then begin
-        warning loc Tentative_incomplete_static "tentative static definition with incomplete type";
-      end else if local && sto' <> Storage_extern then
-        error loc "variable has incomplete type %a" (print_typ env) ty';
-    (* check if alignment is reduced *)
-    check_reduced_alignment loc env ty';
-    (* check for static variables in nonstatic inline functions *)
-    if local && nonstatic_inline
-             && sto' = Storage_static
-             && not (List.mem AConst (attributes_of_type env ty')) then
-      warning loc Static_in_inline "non-constant static local variable '%s' in inline function may be different in different files" s;
-    if local && not isfun && sto' <> Storage_extern && sto' <> Storage_static then
-      (* Local definition *)
-      ((sto', id, ty', init') :: decls, env2)
-    else begin
-      (* Global definition *)
-      emit_elab ~linkage env2 loc (Gdecl(sto', id, ty', init'));
-      (* Make sure the initializer is constant. *)
-      begin match init' with
-      | Some i when not (Ceval.is_constant_init env2 i) ->
-          error loc "initializer is not a compile-time constant"
-      | _ -> ()
-      end;
-      (decls, env2)
-    end in
-  let (decls, env') = List.fold_left enter_decdef ([], env) dl in
-  (List.rev decls, env')
+    (decls, env2)
+  end
 
 (* Processing of K&R-style function definitions.  Synopsis:
       T f(X1, ..., Xn)
@@ -2653,10 +2681,10 @@ let elab_fundef genv spec name defs body loc =
      and additionally they should have an identifier. In both cases a fatal
      error is raised in order to avoid problems at later places. *)
   let add_param env (id, ty) =
-    if wrap incomplete_type loc env ty then
-      fatal_error loc "parameter has incomplete type";
     if id.C.name = "" then
       fatal_error loc "parameter name omitted";
+    if wrap incomplete_type loc env ty then
+      fatal_error loc "parameter '%s' has incomplete type %a" id.C.name (print_typ env) ty;
     Env.add_ident env id Storage_default ty
   in
   (* Enter parameters and extra declarations in the local environment.
@@ -2664,7 +2692,7 @@ let elab_fundef genv spec name defs body loc =
      For prototyped functions this has been done by [elab_fundef_name]
      already, but some parameter may have been shadowed by the
      function name, while it should be the other way around, e.g.
-     [int f(int f) { return f+1; }], with [f] refering to the
+     [int f(int f) { return f+1; }], with [f] referring to the
      parameter [f] and not to the function [f] within the body of the
      function. *)
   let lenv =
@@ -2736,6 +2764,51 @@ let elab_fundef genv spec name defs body loc =
   genv
 
 (* Definitions *)
+let elab_decdef (for_loop: bool) (local: bool) (nonstatic_inline: bool)
+                (env: Env.t) ((spec, namelist): Cabs.init_name_group)
+                (loc: Cabs.loc) : decl list * Env.t =
+  let (sto, inl, noret, tydef, bty, env') =
+    elab_specifier ~only:(namelist=[]) loc env spec in
+  (* Sanity checks on storage class *)
+  if tydef then begin
+    if sto <> Storage_default then
+      error loc "non-default storage class on 'typedef' definition";
+    if namelist = [] then
+      warning loc Missing_declarations "typedef requires a name";
+  end else begin
+    if (sto = Storage_auto || sto = Storage_register) && not local then
+      fatal_error loc "illegal storage class %s on file-scoped variable"
+        (name_of_storage_class sto);
+    if sto <> Storage_default && namelist = [] then
+      warning loc Missing_declarations "declaration does not declare anything";
+  end;
+  let elab_one_name (decls, env) (Init_name (Name (id, decl, attr, loc), init)) =
+    let ((ty, _), env1) =
+      elab_type_declarator loc env bty decl in
+    let a = elab_attributes env attr in
+    let has_fun_typ = is_function_type env ty in
+    if for_loop && (has_fun_typ || sto = Storage_extern || sto = Storage_static || tydef) then
+      error loc "declaration of non-local variable in 'for' loop" ;
+    if has_fun_typ then begin
+      if noret then
+        warning loc Celeven_extension "_Noreturn functions are a C11 extension";
+    end else begin
+      if inl then
+        error loc "'inline' can only appear on functions";
+      if noret then
+        error loc "'_Noreturn' can only appear on functions";
+    end;
+    let a' = if noret then add_attributes [Attr ("noreturn", [])] a else a in
+    if has_std_alignas env ty && has_fun_typ then
+      error loc "alignment specified for function '%s'" id;
+    let decl = (id, add_attributes_type a' ty, init) in
+    if tydef then
+      (decls, enter_typedef loc env1 sto decl)
+    else
+      enter_decdef local nonstatic_inline loc sto (decls, env1) decl
+  in
+  let (decls, env') = List.fold_left elab_one_name ([],env') namelist in
+  (List.rev decls, env')
 
 let elab_definition (for_loop: bool) (local: bool) (nonstatic_inline: bool)
                     (env: Env.t) (def: Cabs.definition)
@@ -2750,18 +2823,7 @@ let elab_definition (for_loop: bool) (local: bool) (nonstatic_inline: bool)
 
   (* "int x = 12, y[10], *z" *)
   | DECDEF(init_name_group, loc) ->
-      let ((dl, env1), sto, tydef) =
-        elab_init_name_group loc env init_name_group in
-      if for_loop then begin
-        let fun_declaration = List.exists (fun (_, ty, _) -> is_function_type env ty) dl in
-        if fun_declaration || sto = Storage_extern || sto = Storage_static || tydef then
-          error loc "declaration of non-local variable in 'for' loop" ;
-      end;
-      if tydef then
-        let env2 = enter_typedefs loc env1 sto dl
-        in ([], env2)
-      else
-        enter_decdefs local nonstatic_inline loc env1 sto dl
+    elab_decdef for_loop local nonstatic_inline env init_name_group loc
 
   (* pragma *)
   | PRAGMA(s, loc) ->
@@ -2888,48 +2950,49 @@ let rec elab_stmt env ctx s =
 (* 6.8.4 Conditional statements *)
 
   | If(a, s1, s2, loc) ->
-      let a',env = elab_expr ctx loc env a in
-      if not (is_scalar_type env a'.etyp) then
+      let a',env' = elab_expr ctx loc (Env.new_scope env) a in
+      if not (is_scalar_type env' a'.etyp) then
         error loc "controlling expression of 'if' does not have scalar type (%a invalid)"
-          (print_typ env) a'.etyp;
-      let s1',env = elab_stmt env ctx s1 in
-      let s2',env =
+          (print_typ env') a'.etyp;
+      let s1' = elab_stmt_new_scope env' ctx s1 in
+      let s2' =
         match s2 with
-          | None -> sskip,env
-          | Some s2 -> elab_stmt env ctx s2
+          | None -> sskip
+          | Some s2 -> elab_stmt_new_scope env' ctx s2
       in
       { sdesc = Sif(a', s1', s2'); sloc = elab_loc loc },env
 
 (* 6.8.5 Iterative statements *)
 
   | WHILE(a, s1, loc) ->
-      let a',env = elab_expr ctx loc env a in
-      if not (is_scalar_type env a'.etyp) then
+      let a',env' = elab_expr ctx loc (Env.new_scope env) a in
+      if not (is_scalar_type env' a'.etyp) then
         error loc "controlling expression of 'while' does not have scalar type (%a invalid)"
-          (print_typ env) a'.etyp;
-      let s1',env = elab_stmt env (ctx_loop ctx) s1 in
+          (print_typ env') a'.etyp;
+      let s1' = elab_stmt_new_scope env' (ctx_loop ctx) s1 in
       { sdesc = Swhile(a', s1'); sloc = elab_loc loc },env
 
   | DOWHILE(a, s1, loc) ->
-      let s1',env = elab_stmt env (ctx_loop ctx) s1 in
-      let a',env = elab_expr ctx loc env a in
-      if not (is_scalar_type env a'.etyp) then
+      let s1' = elab_stmt_new_scope env (ctx_loop ctx) s1 in
+      let a',env' = elab_expr ctx loc (Env.new_scope env) a in
+      if not (is_scalar_type env' a'.etyp) then
         error loc "controlling expression of 'while' does not have scalar type (%a invalid)"
-          (print_typ env) a'.etyp;
+          (print_typ env') a'.etyp;
       { sdesc = Sdowhile(s1', a'); sloc = elab_loc loc },env
 
   | FOR(fc, a2, a3, s1, loc) ->
+      let env' = Env.new_scope env in
       let (a1', env_decls, decls') =
         match fc with
         | Some (FC_EXP a1) ->
-            let a1,env = elab_for_expr ctx loc env (Some a1) in
+            let a1,env = elab_for_expr ctx loc env' (Some a1) in
             (a1, env, None)
         | None ->
-            let a1,env = elab_for_expr ctx loc env None in
+            let a1,env = elab_for_expr ctx loc env' None in
             (a1, env, None)
         | Some (FC_DECL def) ->
             let (dcl, env') = elab_definition true true ctx.ctx_nonstatic_inline
-                                              (Env.new_scope env) def in
+                                              env' def in
             let loc = elab_loc (Cabshelper.get_definitionloc def) in
             (sskip, env',
              Some(List.map (fun d -> {sdesc = Sdecl d; sloc = loc}) dcl)) in
@@ -2941,7 +3004,7 @@ let rec elab_stmt env ctx s =
       if not (is_scalar_type env_test a2'.etyp) then
         error loc "controlling expression of 'for' does not have scalar type (%a invalid)" (print_typ env) a2'.etyp;
       let a3',env_for = elab_for_expr ctx loc env_test a3 in
-      let s1',env_body = elab_stmt env_for (ctx_loop ctx) s1 in
+      let s1' = elab_stmt_new_scope env_for (ctx_loop ctx) s1 in
       let sfor = { sdesc = Sfor(a1', a2', a3', s1'); sloc = elab_loc loc } in
       begin match decls' with
       | None -> sfor,env
@@ -2950,11 +3013,11 @@ let rec elab_stmt env ctx s =
 
 (* 6.8.4 Switch statement *)
   | SWITCH(a, s1, loc) ->
-      let a',env = elab_expr ctx loc env a in
-      if not (is_integer_type env a'.etyp) then
+      let a',env' = elab_expr ctx loc (Env.new_scope env) a in
+      if not (is_integer_type env' a'.etyp) then
         error loc "controlling expression of 'switch' does not have integer type (%a invalid)"
-          (print_typ env) a'.etyp;
-      let s1',env = elab_stmt env (ctx_switch ctx) s1 in
+          (print_typ env') a'.etyp;
+      let s1' = elab_stmt_new_scope env' (ctx_switch ctx) s1 in
       check_switch_cases s1';
       { sdesc = Sswitch(a', s1'); sloc = elab_loc loc },env
 
@@ -3028,6 +3091,10 @@ let rec elab_stmt env ctx s =
   | DEFINITION def ->
       error (Cabshelper.get_definitionloc def) "ill-placed definition";
       sskip,env
+(* Elaborate a statement as a block whose scope is a strict subset of the scope
+   of its enclosing block. *)
+and elab_stmt_new_scope env ctx s =
+  fst (elab_stmt (Env.new_scope env) ctx s)
 
 and elab_block loc env ctx b =
   let b',_ = elab_block_body (Env.new_scope env) ctx b in
@@ -3080,10 +3147,11 @@ let _ = elab_funbody_f := elab_funbody
 
 let elab_file prog =
   reset();
-  let env = Builtins.environment () in
+  let env = Env.initial () in
   let elab_def env d = snd (elab_definition false false false env d) in
   ignore (List.fold_left elab_def env prog);
   let p = elaborated_program () in
   Checks.unused_variables p;
   Checks.unknown_attrs_program p;
+  Checks.non_linear_conditional p;
   p

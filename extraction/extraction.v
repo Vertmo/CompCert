@@ -127,7 +127,7 @@ Extract Constant Compiler.time  => "Timing.time_coq".
 (*Extraction Inline Compiler.apply_total Compiler.apply_partial.*)
 
 (* Cabs *)
-Extract Constant Cabs.cabsloc =>
+Extract Constant Cabs.loc =>
 "{ lineno : int;
    filename: string;
    byteno: int;

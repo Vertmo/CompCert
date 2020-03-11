@@ -29,7 +29,7 @@ let no_loc = ("", -1)
 
 module Ident = struct
   type t = ident
-  let compare id1 id2 = Pervasives.compare id1.stamp id2.stamp
+  let compare id1 id2 = compare id1.stamp id2.stamp
 end
 
 module IdentSet = Set.Make(Ident)
@@ -821,12 +821,23 @@ let is_composite_type env t =
   | TStruct _ | TUnion _ -> true
   | _ -> false
 
+let is_array_type env t =
+  match unroll env t with
+  | TArray _ -> true
+  | _ -> false
+
 let is_function_type env t =
   match unroll env t with
   | TFun _ -> true
   | _ -> false
 
 let is_anonymous_composite = function
+  | TStruct (id,_)
+  | TUnion (id,_) -> id.C.name = ""
+  | _ -> false
+
+let is_anonymous_type = function
+  | TEnum (id,_)
   | TStruct (id,_)
   | TUnion (id,_) -> id.C.name = ""
   | _ -> false
@@ -947,7 +958,7 @@ let binary_conversion env t1 t2 =
       end
   | _, _ -> assert false
 
-(* Conversion on function arguments (with protoypes) *)
+(* Conversion on function arguments (with prototypes) *)
 
 let argument_conversion env t =
   (* Arrays and functions degrade automatically to pointers *)

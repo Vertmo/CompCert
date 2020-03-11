@@ -23,7 +23,7 @@ endif
 
 DIRS=lib common $(ARCHDIRS) backend cfrontend driver \
   flocq/Core flocq/Prop flocq/Calc flocq/IEEE754 \
-  exportclight cparser cparser/MenhirLib
+  exportclight cparser
 
 RECDIRS=lib common $(ARCHDIRS) backend cfrontend driver flocq exportclight cparser
 
@@ -103,12 +103,6 @@ CFRONTEND=Ctypes.v Cop.v Csyntax.v Csem.v Ctyping.v Cstrategy.v Cexec.v \
   Cshmgen.v Cshmgenproof.v \
   Csharpminor.v Cminorgen.v Cminorgenproof.v
 
-# LR(1) parser validator
-
-PARSERVALIDATOR=Alphabet.v Interpreter_complete.v Interpreter.v \
-  Validator_complete.v Automaton.v Interpreter_correct.v Main.v \
-  Validator_safe.v Grammar.v Interpreter_safe.v Tuples.v
-
 # Parser
 
 PARSER=Cabs.v Parser.v
@@ -120,7 +114,7 @@ DRIVER=Compopts.v Compiler.v Complements.v
 # All source files
 
 FILES=$(VLIB) $(COMMON) $(BACKEND) $(CFRONTEND) $(DRIVER) $(FLOCQ) \
-  $(PARSERVALIDATOR) $(PARSER)
+  $(PARSER)
 
 # Generated source files
 
